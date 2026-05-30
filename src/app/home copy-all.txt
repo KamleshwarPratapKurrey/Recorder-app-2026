@@ -1,0 +1,1004 @@
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import Slider from "@react-native-community/slider";
+import { Audio } from "expo-av";
+import * as FileSystem from "expo-file-system/legacy";
+import * as Sharing from "expo-sharing";
+import React, { useEffect, useRef, useState } from "react";
+import {
+  Alert,
+  Animated,
+  FlatList,
+  Keyboard,
+  Platform,
+  StatusBar,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View
+} from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
+
+interface RecordingItem {
+  id: string;
+  uri: string;
+  name: string;
+  duration: string;
+}
+
+const STORAGE_KEY = "@voice_recorder_recordings";
+
+export default function HomeScreen() {
+  const [recording, setRecording] = useState<Audio.Recording | null>(null);
+  const [isRecording, setIsRecording] = useState<boolean>(false);
+  const [isPaused, setIsPaused] = useState<boolean>(false);
+  const [recordings, setRecordings] = useState<RecordingItem[]>([]);
+  const [searchQuery, setSearchQuery] = useState<string>("");
+  const [sound, setSound] = useState<Audio.Sound | null>(null);
+  const [playingId, setPlayingId] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+
+  // Telemetry Trackers
+  const [playbackPosition, setPlaybackPosition] = useState<number>(0);
+  const [playbackDuration, setPlaybackDuration] = useState<number>(0);
+  const [isSeeking, setIsSeeking] = useState<boolean>(false);
+
+  // Real-time Recording Timer State
+  const [recordingMillis, setRecordingMillis] = useState<number>(0);
+  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Keyboard Dynamic Metrics & List Ref
+  const [keyboardHeight, setKeyboardHeight] = useState<number>(0);
+  const flatListRef = useRef<FlatList<RecordingItem>>(null);
+
+  // Animation drivers for the waveform
+  const waveAnim1 = useRef(new Animated.Value(1)).current;
+  const waveAnim2 = useRef(new Animated.Value(1)).current;
+  const waveAnim3 = useRef(new Animated.Value(1)).current;
+
+  const isRecordingActive = isRecording || isPaused;
+
+  // Load recordings and handle keyboard listeners
+  useEffect(() => {
+    async function loadRecordings() {
+      try {
+        const savedRecordings = await AsyncStorage.getItem(STORAGE_KEY);
+        if (savedRecordings) {
+          setRecordings(JSON.parse(savedRecordings));
+        }
+      } catch (error) {
+        console.error("Failed to load recordings:", error);
+      }
+    }
+
+    async function getPermission() {
+      const permission = await Audio.requestPermissionsAsync();
+      if (permission.status !== "granted") {
+        Alert.alert(
+          "Permission Denied",
+          "Microphone access is required to record audio.",
+        );
+      }
+    }
+
+    getPermission();
+    loadRecordings();
+
+    // Listeners to pull system keyboard dimensions dynamically
+    const showEvent =
+      Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
+    const hideEvent =
+      Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
+
+    const showListener = Keyboard.addListener(showEvent, (e) => {
+      setKeyboardHeight(e.endCoordinates.height);
+    });
+    const hideListener = Keyboard.addListener(hideEvent, () => {
+      setKeyboardHeight(0);
+    });
+
+    return () => {
+      showListener.remove();
+      hideListener.remove();
+      clearRecordingTimer();
+      if (sound) {
+        sound.unloadAsync();
+      }
+    };
+  }, [sound]);
+
+  // Handle Waveform Animation Loop
+  useEffect(() => {
+    let animationLoop: Animated.CompositeAnimation;
+
+    if (isRecording && !isPaused) {
+      const createWaveSequence = (
+        animVar: Animated.Value,
+        duration: number,
+      ) => {
+        return Animated.loop(
+          Animated.sequence([
+            Animated.timing(animVar, {
+              toValue: 2.5,
+              duration,
+              useNativeDriver: true,
+            }),
+            Animated.timing(animVar, {
+              toValue: 0.8,
+              duration,
+              useNativeDriver: true,
+            }),
+          ]),
+        );
+      };
+
+      animationLoop = Animated.parallel([
+        createWaveSequence(waveAnim1, 400),
+        createWaveSequence(waveAnim2, 550),
+        createWaveSequence(waveAnim3, 470),
+      ]);
+
+      animationLoop.start();
+    } else {
+      waveAnim1.setValue(1);
+      waveAnim2.setValue(1);
+      waveAnim3.setValue(1);
+    }
+
+    return () => {
+      if (animationLoop) animationLoop.stop();
+    };
+  }, [isRecording, isPaused]);
+
+  // Handle clean scrolling adjustment when focusing an input box
+  const handleInputFocus = (index: number) => {
+    // Delays scrolling slightly to allow the list container padding to update first
+    setTimeout(() => {
+      if (flatListRef.current) {
+        flatListRef.current.scrollToIndex({
+          index,
+          viewPosition: 0.3, // Centers the element neatly above the keyboard view
+          animated: true,
+        });
+      }
+    }, 150);
+  };
+
+  const startRecordingTimer = () => {
+    clearRecordingTimer();
+    recordingTimerRef.current = setInterval(() => {
+      setRecordingMillis((prev) => prev + 1000);
+    }, 1000);
+  };
+
+  const pauseRecordingTimer = () => {
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+  };
+
+  const clearRecordingTimer = () => {
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    setRecordingMillis(0);
+  };
+
+  const formatDuration = (millis: number): string => {
+    if (isNaN(millis) || millis < 0) return "0:00";
+    const minutes = Math.floor(millis / 60000);
+    const seconds = Math.floor((millis % 60000) / 1000);
+    return `${minutes}:${seconds < 10 ? "0" : ""}${seconds}`;
+  };
+
+  const getFormattedDateTime = (): string => {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}_${String(now.getHours()).padStart(2, "0")}-${String(now.getMinutes()).padStart(2, "0")}-${String(now.getSeconds()).padStart(2, "0")}`;
+  };
+
+  async function handleRecordPress() {
+    try {
+      if (!isRecording) {
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: true,
+          playsInSilentModeIOS: true,
+        });
+        const { recording: newRecording } = await Audio.Recording.createAsync(
+          Audio.RecordingOptionsPresets.HIGH_QUALITY,
+        );
+        setRecording(newRecording);
+        setIsRecording(true);
+        setIsPaused(false);
+        startRecordingTimer();
+      } else {
+        if (!isPaused) {
+          await recording?.pauseAsync();
+          setIsPaused(true);
+          pauseRecordingTimer();
+        } else {
+          await recording?.startAsync();
+          setIsPaused(false);
+          recordingTimerRef.current = setInterval(() => {
+            setRecordingMillis((prev) => prev + 1000);
+          }, 1000);
+        }
+      }
+    } catch (err) {
+      console.error("Recording control failure", err);
+    }
+  }
+
+  async function finishRecording() {
+    if (!recording) return;
+
+    try {
+      await recording.stopAndUnloadAsync();
+      await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
+
+      const uri = recording.getURI();
+      const status = await recording.getStatusAsync();
+
+      if (uri && status.durationMillis) {
+        const nextIndex = recordings.length + 1;
+        const compoundName = `Rec#${nextIndex}_${getFormattedDateTime()}`;
+
+        const newRecording: RecordingItem = {
+          id: Date.now().toString(),
+          uri: uri,
+          name: compoundName,
+          duration: formatDuration(status.durationMillis),
+        };
+
+        const updatedList = [newRecording, ...recordings];
+        setRecordings(updatedList);
+        await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(updatedList));
+      }
+    } catch (error) {
+      console.error("Failed to finish recording", error);
+    } finally {
+      setRecording(null);
+      setIsRecording(false);
+      setIsPaused(false);
+      clearRecordingTimer();
+    }
+  }
+
+  const onPlaybackStatusUpdate = (status: any) => {
+    if (status.isLoaded) {
+      if (!isSeeking) {
+        setPlaybackPosition(status.positionMillis);
+      }
+      setPlaybackDuration(status.durationMillis || 0);
+
+      if (status.didJustFinish) {
+        setPlayingId(null);
+        setSound(null);
+        setPlaybackPosition(0);
+      }
+    }
+  };
+
+  async function playRecording(item: RecordingItem) {
+    try {
+      if (sound) {
+        await sound.unloadAsync();
+        setPlaybackPosition(0);
+        if (playingId === item.id) {
+          setPlayingId(null);
+          setSound(null);
+          return;
+        }
+      }
+
+      const { sound: newSound } = await Audio.Sound.createAsync(
+        { uri: item.uri },
+        { shouldPlay: true },
+      );
+
+      setSound(newSound);
+      setPlayingId(item.id);
+      newSound.setOnPlaybackStatusUpdate(onPlaybackStatusUpdate);
+    } catch (error) {
+      console.error("Playback error", error);
+    }
+  }
+
+  const handleSlidingStart = () => {
+    setIsSeeking(true);
+  };
+
+  const handleSlidingComplete = async (value: number) => {
+    if (sound) {
+      await sound.setPositionAsync(value);
+    }
+    setPlaybackPosition(value);
+    setIsSeeking(false);
+  };
+
+  const updateFileName = async (id: string, newName: string) => {
+    const updatedList = recordings.map((item) =>
+      item.id === id ? { ...item, name: newName } : item,
+    );
+    setRecordings(updatedList);
+    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(updatedList));
+  };
+
+  const toggleSelectRecording = (id: string) => {
+    setSelectedIds((prevSelected) =>
+      prevSelected.includes(id)
+        ? prevSelected.filter((selectedId) => selectedId !== id)
+        : [...prevSelected, id],
+    );
+  };
+
+  const handleSelectAllToggle = () => {
+    if (selectedIds.length === filteredRecordings.length) {
+      setSelectedIds([]);
+    } else {
+      const allFilteredIds = filteredRecordings.map((rec) => rec.id);
+      setSelectedIds(allFilteredIds);
+    }
+  };
+
+  async function deleteRecording(item: RecordingItem) {
+    Alert.alert(
+      "Delete Recording",
+      `Are you sure you want to delete "${item.name}" permanently?`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              if (playingId === item.id && sound) {
+                await sound.unloadAsync();
+                setPlayingId(null);
+                setSound(null);
+              }
+
+              const fileInfo = await FileSystem.getInfoAsync(item.uri);
+              if (fileInfo.exists) {
+                await FileSystem.deleteAsync(item.uri);
+              }
+
+              const updatedList = recordings.filter((r) => r.id !== item.id);
+              setRecordings(updatedList);
+              setSelectedIds((prev) => prev.filter((id) => id !== item.id));
+              await AsyncStorage.setItem(
+                STORAGE_KEY,
+                JSON.stringify(updatedList),
+              );
+            } catch (error) {
+              console.error("Failed to delete file", error);
+            }
+          },
+        },
+      ],
+    );
+  }
+
+  async function deleteSelectedRecordings() {
+    if (selectedIds.length === 0) return;
+
+    Alert.alert(
+      "Delete Selected",
+      `Are you sure you want to delete the ${selectedIds.length} selected recordings permanently?`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete All",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              let isPlayingDeleted = false;
+              const itemsToDelete = recordings.filter((r) =>
+                selectedIds.includes(r.id),
+              );
+
+              await Promise.all(
+                itemsToDelete.map(async (item) => {
+                  if (playingId === item.id) {
+                    isPlayingDeleted = true;
+                  }
+                  const fileInfo = await FileSystem.getInfoAsync(item.uri);
+                  if (fileInfo.exists) {
+                    await FileSystem.deleteAsync(item.uri);
+                  }
+                }),
+              );
+
+              if (isPlayingDeleted && sound) {
+                await sound.unloadAsync();
+                setPlayingId(null);
+                setSound(null);
+              }
+
+              const updatedList = recordings.filter(
+                (r) => !selectedIds.includes(r.id),
+              );
+              setRecordings(updatedList);
+              setSelectedIds([]);
+              await AsyncStorage.setItem(
+                STORAGE_KEY,
+                JSON.stringify(updatedList),
+              );
+            } catch (error) {
+              console.error("Bulk deletion failed:", error);
+            }
+          },
+        },
+      ],
+    );
+  }
+
+  async function shareRecording(item: RecordingItem) {
+    const isAvailable = await Sharing.isAvailableAsync();
+    if (!isAvailable) {
+      Alert.alert("Error", "Sharing is not available on this device");
+      return;
+    }
+
+    let tempUri: string | null = null;
+    try {
+      const sourceInfo = await FileSystem.getInfoAsync(item.uri);
+      if (!sourceInfo.exists) {
+        Alert.alert("Share Failed", "Recording file was not found.");
+        return;
+      }
+
+      const baseFileName = item.uri.split("/").pop() || "recording.m4a";
+      const fileExtension = baseFileName.includes(".")
+        ? baseFileName.split(".").pop()
+        : "m4a";
+      const cleanFileName = item.name.replace(/[^a-zA-Z0-9_-]/g, "_");
+      tempUri = `${FileSystem.cacheDirectory}${cleanFileName}_${Date.now()}.${fileExtension}`;
+
+      await FileSystem.copyAsync({ from: item.uri, to: tempUri });
+
+      await Sharing.shareAsync(tempUri, {
+        mimeType: "audio/x-m4a",
+        dialogTitle: `Share "${item.name}"`,
+      });
+    } catch (error) {
+      console.error("Sharing Error", error);
+    } finally {
+      if (tempUri) {
+        const tempInfo = await FileSystem.getInfoAsync(tempUri);
+        if (tempInfo.exists) {
+          await FileSystem.deleteAsync(tempUri, { idempotent: true });
+        }
+      }
+    }
+  }
+
+  const filteredRecordings = recordings.filter((rec) =>
+    rec.name.toLowerCase().includes(searchQuery.toLowerCase()),
+  );
+
+  const isAllSelected =
+    filteredRecordings.length > 0 &&
+    selectedIds.length === filteredRecordings.length;
+
+  const renderRecordingCard = ({
+    item,
+    index,
+  }: {
+    item: RecordingItem;
+    index: number;
+  }) => {
+    const isCurrentPlaying = playingId === item.id;
+    const isSelected = selectedIds.includes(item.id);
+    const timeCompleted = isCurrentPlaying ? playbackPosition : 0;
+    const timeRemaining = isCurrentPlaying
+      ? Math.max(0, playbackDuration - playbackPosition)
+      : 0;
+
+    return (
+      <View style={styles.card}>
+        <View style={styles.cardMainRow}>
+          <TouchableOpacity
+            style={styles.cardCheckboxHitbox}
+            onPress={() => toggleSelectRecording(item.id)}
+            activeOpacity={0.6}
+          >
+            <View
+              style={[
+                styles.cardCheckboxOutline,
+                isSelected && styles.cardCheckboxChecked,
+              ]}
+            >
+              {isSelected && <View style={styles.cardCheckboxInnerDot} />}
+            </View>
+          </TouchableOpacity>
+
+          <View style={styles.cardRightContent}>
+            <View style={styles.cardMain}>
+              <TextInput
+                style={styles.fileNameInput}
+                value={item.name}
+                onChangeText={(text) => updateFileName(item.id, text)}
+                onFocus={() => handleInputFocus(index)}
+                placeholder="Rename recording"
+                placeholderTextColor="#7a7a7a"
+              />
+              <Text style={styles.durationText}>
+                {isCurrentPlaying
+                  ? formatDuration(playbackDuration)
+                  : item.duration}
+              </Text>
+            </View>
+
+            {isCurrentPlaying && (
+              <View style={styles.timelineContainer}>
+                <Slider
+                  style={styles.slider}
+                  minimumValue={0}
+                  maximumValue={playbackDuration}
+                  value={playbackPosition}
+                  minimumTrackTintColor="#007AFF"
+                  maximumTrackTintColor="#D3D3D3"
+                  thumbTintColor="#007AFF"
+                  onSlidingStart={handleSlidingStart}
+                  onSlidingComplete={handleSlidingComplete}
+                />
+                <View style={styles.timeLabelContainer}>
+                  <Text style={styles.timeText}>
+                    {formatDuration(timeCompleted)}
+                  </Text>
+                  <Text style={styles.timeText}>
+                    -{formatDuration(timeRemaining)}
+                  </Text>
+                </View>
+              </View>
+            )}
+
+            <View style={styles.actionsContainer}>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.btnDelete]}
+                onPress={() => deleteRecording(item)}
+              >
+                <Text style={styles.actionButtonText}>🗑 Delete</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[
+                  styles.actionButton,
+                  isCurrentPlaying ? styles.btnPause : styles.btnPlay,
+                ]}
+                onPress={() => playRecording(item)}
+              >
+                <Text style={styles.actionButtonText}>
+                  {isCurrentPlaying ? "✕ Stop" : "▶ Play"}
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.actionButton, styles.btnShare]}
+                onPress={() => shareRecording(item)}
+              >
+                <Text style={styles.actionButtonText}>🔗 Share</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </View>
+    );
+  };
+
+  return (
+    <SafeAreaView style={styles.container} edges={["top", "left", "right"]}>
+      <StatusBar barStyle="dark-content" />
+
+      {/* FIXED TOP HEADER */}
+      <View style={styles.fixedHeaderContainer}>
+        <Text style={styles.headerTitle}>Voice Recorder</Text>
+
+        <View style={styles.searchContainer}>
+          <TextInput
+            style={styles.searchBar}
+            placeholder="🔎 Search by name or date (e.g. 2026-05)..."
+            placeholderTextColor="#A0A5AA"
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+          />
+        </View>
+
+        {filteredRecordings.length > 0 && (
+          <View style={styles.utilityHeaderRow}>
+            <TouchableOpacity
+              style={styles.selectAllToggleBtn}
+              onPress={handleSelectAllToggle}
+              activeOpacity={0.7}
+            >
+              <View
+                style={[
+                  styles.checkboxOutline,
+                  isAllSelected && styles.checkboxChecked,
+                ]}
+              >
+                {isAllSelected && <View style={styles.checkboxInnerDot} />}
+              </View>
+              <Text style={styles.utilityHeaderText}>
+                {isAllSelected ? "Deselect All" : "Select All"}
+              </Text>
+            </TouchableOpacity>
+
+            {selectedIds.length > 0 && (
+              <TouchableOpacity
+                style={styles.bulkDeleteButton}
+                onPress={deleteSelectedRecordings}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.bulkDeleteText}>
+                  🗑 Delete Selected ({selectedIds.length})
+                </Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        )}
+      </View>
+
+      {/* SCROLLING RECORDINGS LIST */}
+      {filteredRecordings.length === 0 ? (
+        <View style={styles.emptyContainer}>
+          <Text style={styles.emptyText}>
+            {searchQuery
+              ? "No matching recordings found."
+              : "No recordings yet. Tap below to start!"}
+          </Text>
+        </View>
+      ) : (
+        <FlatList
+          ref={flatListRef}
+          data={filteredRecordings}
+          renderItem={renderRecordingCard}
+          keyExtractor={(item) => item.id}
+          // Dynamically expands list padding on keyboard show so hidden cards can be scrolled upward
+          contentContainerStyle={[
+            styles.listScrollContent,
+            { paddingBottom: keyboardHeight > 0 ? keyboardHeight + 100 : 160 },
+          ]}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="on-drag"
+        />
+      )}
+
+      {/* STATIC FIXED CONTROL FOOTER PANEL */}
+      <View
+        style={[
+          styles.footer,
+          keyboardHeight > 0 && styles.footerKeyboardActive,
+        ]}
+      >
+        {isRecordingActive && (
+          <View style={styles.waveContainer}>
+            <Animated.View
+              style={[
+                styles.waveBar,
+                { transform: [{ scaleY: waveAnim1 }] },
+                isPaused && styles.wavePaused,
+              ]}
+            />
+            <Animated.View
+              style={[
+                styles.waveBar,
+                styles.waveBarLong,
+                { transform: [{ scaleY: waveAnim2 }] },
+                isPaused && styles.wavePaused,
+              ]}
+            />
+            <Animated.View
+              style={[
+                styles.waveBar,
+                { transform: [{ scaleY: waveAnim3 }] },
+                isPaused && styles.wavePaused,
+              ]}
+            />
+            <Animated.View
+              style={[
+                styles.waveBar,
+                styles.waveBarLong,
+                { transform: [{ scaleY: waveAnim1 }] },
+                isPaused && styles.wavePaused,
+              ]}
+            />
+            <Animated.View
+              style={[
+                styles.waveBar,
+                { transform: [{ scaleY: waveAnim2 }] },
+                isPaused && styles.wavePaused,
+              ]}
+            />
+          </View>
+        )}
+
+        <View style={styles.recordingRow}>
+          <TouchableOpacity
+            style={[
+              styles.recordButton,
+              isRecordingActive && styles.recordingActive,
+            ]}
+            onPress={handleRecordPress}
+            activeOpacity={0.8}
+          >
+            {isRecordingActive ? (
+              isPaused ? (
+                <Text style={styles.controlIconText}>▶</Text>
+              ) : (
+                <Text style={styles.liveTimerText}>
+                  {formatDuration(recordingMillis)}
+                </Text>
+              )
+            ) : (
+              <View style={styles.innerRecordCircle} />
+            )}
+          </TouchableOpacity>
+
+          {isRecordingActive && (
+            <TouchableOpacity
+              style={styles.finishButton}
+              onPress={finishRecording}
+              activeOpacity={0.8}
+            >
+              <Text style={styles.finishButtonText}>✓ Finish</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+
+        <Text style={styles.statusText}>
+          {!isRecordingActive
+            ? "Tap to start recording"
+            : isPaused
+              ? "Recording paused. Tap to resume or click Finish"
+              : "Recording active... Tap button to pause"}
+        </Text>
+      </View>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#F8F9FA" },
+  fixedHeaderContainer: {
+    backgroundColor: "#F8F9FA",
+    zIndex: 10,
+    paddingBottom: 4,
+  },
+  headerTitle: {
+    fontSize: 26,
+    fontWeight: "700",
+    color: "#1A1D20",
+    textAlign: "center",
+    marginTop: 12,
+    marginBottom: 8,
+  },
+  searchContainer: { paddingHorizontal: 16, marginBottom: 12 },
+  searchBar: {
+    backgroundColor: "#d7d7d7",
+    paddingVertical: 16,
+    paddingHorizontal: 16,
+    borderRadius: 16,
+    fontSize: 15,
+    color: "#212529",
+  },
+  utilityHeaderRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingHorizontal: 20,
+    marginBottom: 8,
+    height: 30,
+  },
+  selectAllToggleBtn: { flexDirection: "row", alignItems: "center" },
+  checkboxOutline: {
+    width: 20,
+    height: 20,
+    borderRadius: 6,
+    borderWidth: 2,
+    borderColor: "#A0A5AA",
+    justifyContent: "center",
+    alignItems: "center",
+    marginRight: 8,
+  },
+  checkboxChecked: { borderColor: "#007AFF", backgroundColor: "#007AFF" },
+  checkboxInnerDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: "#FFFFFF",
+  },
+  utilityHeaderText: { fontSize: 14, fontWeight: "600", color: "#495057" },
+  bulkDeleteButton: {
+    backgroundColor: "#FFE3E3",
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+  },
+  bulkDeleteText: { color: "#D93838", fontSize: 13, fontWeight: "700" },
+
+  listScrollContent: { paddingHorizontal: 16, paddingTop: 4 },
+  emptyContainer: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    paddingBottom: 100,
+  },
+  emptyText: { color: "#6C757D", fontSize: 16 },
+
+  card: {
+    backgroundColor: "#ededed",
+    borderRadius: 16,
+    padding: 14,
+    marginBottom: 12,
+    shadowColor: "#00000065",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 8,
+    elevation: 2,
+  },
+  cardMainRow: { flexDirection: "row", alignItems: "center" },
+  cardCheckboxHitbox: { paddingVertical: 10, paddingRight: 12 },
+  cardCheckboxOutline: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    borderWidth: 2,
+    borderColor: "#B0B5BB",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  cardCheckboxChecked: { borderColor: "#007AFF", backgroundColor: "#007AFF" },
+  cardCheckboxInnerDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: "#FFFFFF",
+  },
+  cardRightContent: { flex: 1 },
+  cardMain: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    borderBottomWidth: 1,
+    borderBottomColor: "#dadada",
+    paddingBottom: 10,
+    marginBottom: 10,
+  },
+  fileNameInput: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#212529",
+    flex: 1,
+    marginRight: 10,
+    paddingVertical: 4,
+  },
+  durationText: { fontSize: 14, color: "#6C757D", fontWeight: "500" },
+  timelineContainer: { marginBottom: 12, paddingHorizontal: 4 },
+  slider: { width: "100%", height: 30, marginLeft: -10 },
+  timeLabelContainer: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginTop: -4,
+    paddingHorizontal: 2,
+  },
+  timeText: { fontSize: 12, color: "#6C757D", fontWeight: "600" },
+  actionsContainer: {
+    flexDirection: "row",
+    justifyContent: "flex-end",
+    gap: 8,
+  },
+  actionButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 14,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  actionButtonText: { color: "#000000", fontSize: 13, fontWeight: "600" },
+  btnPlay: { backgroundColor: "#c6dcf4" },
+  btnPause: { backgroundColor: "#f2dcc5" },
+  btnShare: { backgroundColor: "#bcf9d1" },
+  btnDelete: { backgroundColor: "#f1b7b7" },
+
+  footer: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: "#FFFFFF",
+    paddingTop: 12,
+    paddingBottom: 32,
+    alignItems: "center",
+    borderTopWidth: 1,
+    borderTopColor: "#E9ECEF",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: -4 },
+    shadowOpacity: 0.04,
+    shadowRadius: 6,
+    elevation: 10,
+  },
+  footerKeyboardActive: { paddingBottom: 12 },
+  waveContainer: {
+    flexDirection: "row",
+    height: 30,
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 12,
+    gap: 6,
+  },
+  waveBar: {
+    width: 4,
+    height: 10,
+    backgroundColor: "#FF3B30",
+    borderRadius: 2,
+  },
+  waveBarLong: { height: 14 },
+  wavePaused: { backgroundColor: "#A0A5AA" },
+  recordingRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    width: "100%",
+    position: "relative",
+    marginBottom: 8,
+  },
+  recordButton: {
+    width: 74,
+    height: 74,
+    borderRadius: 37,
+    borderWidth: 4,
+    borderColor: "#E9ECEF",
+    backgroundColor: "#FFFFFF",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  recordingActive: { borderColor: "#FF3B30" },
+  innerRecordCircle: {
+    width: 54,
+    height: 54,
+    borderRadius: 27,
+    backgroundColor: "#FF3B30",
+  },
+  controlIconText: { fontSize: 26, color: "#FF3B30", textAlign: "center" },
+  liveTimerText: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#FF3B30",
+    textAlign: "center",
+  },
+  pauseIconContainer: {
+    flexDirection: "row",
+    justifyContent: "center",
+    gap: 6,
+  },
+  pauseBar: {
+    width: 6,
+    height: 24,
+    backgroundColor: "#FF3B30",
+    borderRadius: 2,
+  },
+  finishButton: {
+    position: "absolute",
+    right: "15%",
+    backgroundColor: "#34C759",
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+    borderRadius: 25,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.15,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  finishButtonText: { color: "#FFFFFF", fontWeight: "700", fontSize: 15 },
+  statusText: {
+    fontSize: 13,
+    color: "#6C757D",
+    fontWeight: "500",
+    textAlign: "center",
+    marginTop: 4,
+  },
+});
