@@ -1,4 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import Slider from "@react-native-community/slider";
 import { Audio } from "expo-av";
 import * as FileSystem from "expo-file-system/legacy";
 import * as Sharing from "expo-sharing";
@@ -6,6 +7,7 @@ import React, { useEffect, useRef, useState } from "react";
 import {
   Alert,
   Animated,
+  FlatList,
   Keyboard,
   Platform,
   StatusBar,
@@ -13,10 +15,8 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
-  TouchableWithoutFeedback,
   View,
 } from "react-native";
-import { KeyboardAwareScrollView } from "react-native-keyboard-aware-scroll-view";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 interface RecordingItem {
@@ -36,6 +36,20 @@ export default function HomeScreen() {
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [sound, setSound] = useState<Audio.Sound | null>(null);
   const [playingId, setPlayingId] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+
+  // Telemetry Trackers
+  const [playbackPosition, setPlaybackPosition] = useState<number>(0);
+  const [playbackDuration, setPlaybackDuration] = useState<number>(0);
+  const [isSeeking, setIsSeeking] = useState<boolean>(false);
+
+  // Real-time Recording Timer State
+  const [recordingMillis, setRecordingMillis] = useState<number>(0);
+  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Keyboard Dynamic Metrics & List Ref
+  const [keyboardHeight, setKeyboardHeight] = useState<number>(0);
+  const flatListRef = useRef<FlatList<RecordingItem>>(null);
 
   // Animation drivers for the waveform
   const waveAnim1 = useRef(new Animated.Value(1)).current;
@@ -44,7 +58,7 @@ export default function HomeScreen() {
 
   const isRecordingActive = isRecording || isPaused;
 
-  // Load recordings on mount
+  // Load recordings and handle keyboard listeners
   useEffect(() => {
     async function loadRecordings() {
       try {
@@ -70,7 +84,23 @@ export default function HomeScreen() {
     getPermission();
     loadRecordings();
 
+    // Listeners to pull system keyboard dimensions dynamically
+    const showEvent =
+      Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
+    const hideEvent =
+      Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
+
+    const showListener = Keyboard.addListener(showEvent, (e) => {
+      setKeyboardHeight(e.endCoordinates.height);
+    });
+    const hideListener = Keyboard.addListener(hideEvent, () => {
+      setKeyboardHeight(0);
+    });
+
     return () => {
+      showListener.remove();
+      hideListener.remove();
+      clearRecordingTimer();
       if (sound) {
         sound.unloadAsync();
       }
@@ -120,10 +150,47 @@ export default function HomeScreen() {
     };
   }, [isRecording, isPaused]);
 
+  // Handle clean scrolling adjustment when focusing an input box
+  const handleInputFocus = (index: number) => {
+    // Delays scrolling slightly to allow the list container padding to update first
+    setTimeout(() => {
+      if (flatListRef.current) {
+        flatListRef.current.scrollToIndex({
+          index,
+          viewPosition: 0.3, // Centers the element neatly above the keyboard view
+          animated: true,
+        });
+      }
+    }, 150);
+  };
+
+  const startRecordingTimer = () => {
+    clearRecordingTimer();
+    recordingTimerRef.current = setInterval(() => {
+      setRecordingMillis((prev) => prev + 1000);
+    }, 1000);
+  };
+
+  const pauseRecordingTimer = () => {
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+  };
+
+  const clearRecordingTimer = () => {
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    setRecordingMillis(0);
+  };
+
   const formatDuration = (millis: number): string => {
+    if (isNaN(millis) || millis < 0) return "0:00";
     const minutes = Math.floor(millis / 60000);
-    const seconds = ((millis % 60000) / 1000).toFixed(0);
-    return `${minutes}:${Number(seconds) < 10 ? "0" : ""}${seconds}`;
+    const seconds = Math.floor((millis % 60000) / 1000);
+    return `${minutes}:${seconds < 10 ? "0" : ""}${seconds}`;
   };
 
   const getFormattedDateTime = (): string => {
@@ -144,13 +211,18 @@ export default function HomeScreen() {
         setRecording(newRecording);
         setIsRecording(true);
         setIsPaused(false);
+        startRecordingTimer();
       } else {
         if (!isPaused) {
           await recording?.pauseAsync();
           setIsPaused(true);
+          pauseRecordingTimer();
         } else {
           await recording?.startAsync();
           setIsPaused(false);
+          recordingTimerRef.current = setInterval(() => {
+            setRecordingMillis((prev) => prev + 1000);
+          }, 1000);
         }
       }
     } catch (err) {
@@ -189,13 +261,30 @@ export default function HomeScreen() {
       setRecording(null);
       setIsRecording(false);
       setIsPaused(false);
+      clearRecordingTimer();
     }
   }
+
+  const onPlaybackStatusUpdate = (status: any) => {
+    if (status.isLoaded) {
+      if (!isSeeking) {
+        setPlaybackPosition(status.positionMillis);
+      }
+      setPlaybackDuration(status.durationMillis || 0);
+
+      if (status.didJustFinish) {
+        setPlayingId(null);
+        setSound(null);
+        setPlaybackPosition(0);
+      }
+    }
+  };
 
   async function playRecording(item: RecordingItem) {
     try {
       if (sound) {
         await sound.unloadAsync();
+        setPlaybackPosition(0);
         if (playingId === item.id) {
           setPlayingId(null);
           setSound(null);
@@ -210,17 +299,23 @@ export default function HomeScreen() {
 
       setSound(newSound);
       setPlayingId(item.id);
-
-      newSound.setOnPlaybackStatusUpdate((status) => {
-        if (status.isLoaded && status.didJustFinish) {
-          setPlayingId(null);
-          setSound(null);
-        }
-      });
+      newSound.setOnPlaybackStatusUpdate(onPlaybackStatusUpdate);
     } catch (error) {
       console.error("Playback error", error);
     }
   }
+
+  const handleSlidingStart = () => {
+    setIsSeeking(true);
+  };
+
+  const handleSlidingComplete = async (value: number) => {
+    if (sound) {
+      await sound.setPositionAsync(value);
+    }
+    setPlaybackPosition(value);
+    setIsSeeking(false);
+  };
 
   const updateFileName = async (id: string, newName: string) => {
     const updatedList = recordings.map((item) =>
@@ -228,6 +323,23 @@ export default function HomeScreen() {
     );
     setRecordings(updatedList);
     await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(updatedList));
+  };
+
+  const toggleSelectRecording = (id: string) => {
+    setSelectedIds((prevSelected) =>
+      prevSelected.includes(id)
+        ? prevSelected.filter((selectedId) => selectedId !== id)
+        : [...prevSelected, id],
+    );
+  };
+
+  const handleSelectAllToggle = () => {
+    if (selectedIds.length === filteredRecordings.length) {
+      setSelectedIds([]);
+    } else {
+      const allFilteredIds = filteredRecordings.map((rec) => rec.id);
+      setSelectedIds(allFilteredIds);
+    }
   };
 
   async function deleteRecording(item: RecordingItem) {
@@ -254,12 +366,67 @@ export default function HomeScreen() {
 
               const updatedList = recordings.filter((r) => r.id !== item.id);
               setRecordings(updatedList);
+              setSelectedIds((prev) => prev.filter((id) => id !== item.id));
               await AsyncStorage.setItem(
                 STORAGE_KEY,
                 JSON.stringify(updatedList),
               );
             } catch (error) {
               console.error("Failed to delete file", error);
+            }
+          },
+        },
+      ],
+    );
+  }
+
+  async function deleteSelectedRecordings() {
+    if (selectedIds.length === 0) return;
+
+    Alert.alert(
+      "Delete Selected",
+      `Are you sure you want to delete the ${selectedIds.length} selected recordings permanently?`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete All",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              let isPlayingDeleted = false;
+              const itemsToDelete = recordings.filter((r) =>
+                selectedIds.includes(r.id),
+              );
+
+              await Promise.all(
+                itemsToDelete.map(async (item) => {
+                  if (playingId === item.id) {
+                    isPlayingDeleted = true;
+                  }
+                  const fileInfo = await FileSystem.getInfoAsync(item.uri);
+                  if (fileInfo.exists) {
+                    await FileSystem.deleteAsync(item.uri);
+                  }
+                }),
+              );
+
+              if (isPlayingDeleted && sound) {
+                await sound.unloadAsync();
+                setPlayingId(null);
+                setSound(null);
+              }
+
+              const updatedList = recordings.filter(
+                (r) => !selectedIds.includes(r.id),
+              );
+              setRecordings(updatedList);
+              setSelectedIds([]);
+              await AsyncStorage.setItem(
+                STORAGE_KEY,
+                JSON.stringify(updatedList),
+              );
+            } catch (error) {
+              console.error("Bulk deletion failed:", error);
             }
           },
         },
@@ -311,96 +478,201 @@ export default function HomeScreen() {
     rec.name.toLowerCase().includes(searchQuery.toLowerCase()),
   );
 
-  return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="dark-content" />
+  const isAllSelected =
+    filteredRecordings.length > 0 &&
+    selectedIds.length === filteredRecordings.length;
 
-      {/* Modern Scrolling Container handling dynamic keyboard offsets flawlessly */}
-      <KeyboardAwareScrollView
-        style={styles.scrollView}
-        contentContainerStyle={styles.scrollContent}
-        extraScrollHeight={Platform.OS === "ios" ? 40 : 80}
-        enableOnAndroid={true}
-        keyboardShouldPersistTaps="handled"
-      >
-        <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
-          <View style={styles.innerWrapper}>
-            <Text style={styles.headerTitle}>Voice Recorder</Text>
+  const renderRecordingCard = ({
+    item,
+    index,
+  }: {
+    item: RecordingItem;
+    index: number;
+  }) => {
+    const isCurrentPlaying = playingId === item.id;
+    const isSelected = selectedIds.includes(item.id);
+    const timeCompleted = isCurrentPlaying ? playbackPosition : 0;
+    const timeRemaining = isCurrentPlaying
+      ? Math.max(0, playbackDuration - playbackPosition)
+      : 0;
 
-            {/* Dual Search Input Bar */}
-            <View style={styles.searchContainer}>
+    return (
+      <View style={styles.card}>
+        <View style={styles.cardMainRow}>
+          <TouchableOpacity
+            style={styles.cardCheckboxHitbox}
+            onPress={() => toggleSelectRecording(item.id)}
+            activeOpacity={0.6}
+          >
+            <View
+              style={[
+                styles.cardCheckboxOutline,
+                isSelected && styles.cardCheckboxChecked,
+              ]}
+            >
+              {isSelected && <View style={styles.cardCheckboxInnerDot} />}
+            </View>
+          </TouchableOpacity>
+
+          <View style={styles.cardRightContent}>
+            <View style={styles.cardMain}>
               <TextInput
-                style={styles.searchBar}
-                placeholder="🔎 Search by name or date (e.g. 2026-05)..."
-                placeholderTextColor="#A0A5AA"
-                value={searchQuery}
-                onChangeText={setSearchQuery}
+                style={styles.fileNameInput}
+                value={item.name}
+                onChangeText={(text) => updateFileName(item.id, text)}
+                onFocus={() => handleInputFocus(index)}
+                placeholder="Rename recording"
+                placeholderTextColor="#7a7a7a"
               />
+              <Text style={styles.durationText}>
+                {isCurrentPlaying
+                  ? formatDuration(playbackDuration)
+                  : item.duration}
+              </Text>
             </View>
 
-            {filteredRecordings.length === 0 ? (
-              <View style={styles.emptyContainer}>
-                <Text style={styles.emptyText}>
-                  {searchQuery
-                    ? "No matching recordings found."
-                    : "No recordings yet. Tap below to start!"}
-                </Text>
-              </View>
-            ) : (
-              <View style={styles.listWrapper}>
-                {filteredRecordings.map((item) => {
-                  const isCurrentPlaying = playingId === item.id;
-                  return (
-                    <View key={item.id} style={styles.card}>
-                      <View style={styles.cardMain}>
-                        <TextInput
-                          style={styles.fileNameInput}
-                          value={item.name}
-                          onChangeText={(text) => updateFileName(item.id, text)}
-                          placeholder="Rename recording"
-                          placeholderTextColor="#7a7a7a"
-                        />
-                        <Text style={styles.durationText}>{item.duration}</Text>
-                      </View>
-
-                      <View style={styles.actionsContainer}>
-                        <TouchableOpacity
-                          style={[styles.actionButton, styles.btnDelete]}
-                          onPress={() => deleteRecording(item)}
-                        >
-                          <Text style={styles.actionButtonText}>🗑 Delete</Text>
-                        </TouchableOpacity>
-
-                        <TouchableOpacity
-                          style={[
-                            styles.actionButton,
-                            isCurrentPlaying ? styles.btnPause : styles.btnPlay,
-                          ]}
-                          onPress={() => playRecording(item)}
-                        >
-                          <Text style={styles.actionButtonText}>
-                            {isCurrentPlaying ? "✕ Stop" : "▶ Play"}
-                          </Text>
-                        </TouchableOpacity>
-
-                        <TouchableOpacity
-                          style={[styles.actionButton, styles.btnShare]}
-                          onPress={() => shareRecording(item)}
-                        >
-                          <Text style={styles.actionButtonText}>🔗 Share</Text>
-                        </TouchableOpacity>
-                      </View>
-                    </View>
-                  );
-                })}
+            {isCurrentPlaying && (
+              <View style={styles.timelineContainer}>
+                <Slider
+                  style={styles.slider}
+                  minimumValue={0}
+                  maximumValue={playbackDuration}
+                  value={playbackPosition}
+                  minimumTrackTintColor="#007AFF"
+                  maximumTrackTintColor="#D3D3D3"
+                  thumbTintColor="#007AFF"
+                  onSlidingStart={handleSlidingStart}
+                  onSlidingComplete={handleSlidingComplete}
+                />
+                <View style={styles.timeLabelContainer}>
+                  <Text style={styles.timeText}>
+                    {formatDuration(timeCompleted)}
+                  </Text>
+                  <Text style={styles.timeText}>
+                    -{formatDuration(timeRemaining)}
+                  </Text>
+                </View>
               </View>
             )}
-          </View>
-        </TouchableWithoutFeedback>
-      </KeyboardAwareScrollView>
 
-      {/* Control Footer - Always safe, independent layout */}
-      <View style={styles.footer}>
+            <View style={styles.actionsContainer}>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.btnDelete]}
+                onPress={() => deleteRecording(item)}
+              >
+                <Text style={styles.actionButtonText}>🗑 Delete</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[
+                  styles.actionButton,
+                  isCurrentPlaying ? styles.btnPause : styles.btnPlay,
+                ]}
+                onPress={() => playRecording(item)}
+              >
+                <Text style={styles.actionButtonText}>
+                  {isCurrentPlaying ? "✕ Stop" : "▶ Play"}
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.actionButton, styles.btnShare]}
+                onPress={() => shareRecording(item)}
+              >
+                <Text style={styles.actionButtonText}>🔗 Share</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </View>
+    );
+  };
+
+  return (
+    <SafeAreaView style={styles.container} edges={["top", "left", "right"]}>
+      <StatusBar barStyle="dark-content" />
+
+      {/* FIXED TOP HEADER */}
+      <View style={styles.fixedHeaderContainer}>
+        <Text style={styles.headerTitle}>Voice Recorder</Text>
+
+        <View style={styles.searchContainer}>
+          <TextInput
+            style={styles.searchBar}
+            placeholder="🔎 Search by name or date (e.g. 2026-05)..."
+            placeholderTextColor="#A0A5AA"
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+          />
+        </View>
+
+        {filteredRecordings.length > 0 && (
+          <View style={styles.utilityHeaderRow}>
+            <TouchableOpacity
+              style={styles.selectAllToggleBtn}
+              onPress={handleSelectAllToggle}
+              activeOpacity={0.7}
+            >
+              <View
+                style={[
+                  styles.checkboxOutline,
+                  isAllSelected && styles.checkboxChecked,
+                ]}
+              >
+                {isAllSelected && <View style={styles.checkboxInnerDot} />}
+              </View>
+              <Text style={styles.utilityHeaderText}>
+                {isAllSelected ? "Deselect All" : "Select All"}
+              </Text>
+            </TouchableOpacity>
+
+            {selectedIds.length > 0 && (
+              <TouchableOpacity
+                style={styles.bulkDeleteButton}
+                onPress={deleteSelectedRecordings}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.bulkDeleteText}>
+                  🗑 Delete Selected ({selectedIds.length})
+                </Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        )}
+      </View>
+
+      {/* SCROLLING RECORDINGS LIST */}
+      {filteredRecordings.length === 0 ? (
+        <View style={styles.emptyContainer}>
+          <Text style={styles.emptyText}>
+            {searchQuery
+              ? "No matching recordings found."
+              : "No recordings yet. Tap below to start!"}
+          </Text>
+        </View>
+      ) : (
+        <FlatList
+          ref={flatListRef}
+          data={filteredRecordings}
+          renderItem={renderRecordingCard}
+          keyExtractor={(item) => item.id}
+          // Dynamically expands list padding on keyboard show so hidden cards can be scrolled upward
+          contentContainerStyle={[
+            styles.listScrollContent,
+            { paddingBottom: keyboardHeight > 0 ? keyboardHeight + 100 : 160 },
+          ]}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="on-drag"
+        />
+      )}
+
+      {/* STATIC FIXED CONTROL FOOTER PANEL */}
+      <View
+        style={[
+          styles.footer,
+          keyboardHeight > 0 && styles.footerKeyboardActive,
+        ]}
+      >
         {isRecordingActive && (
           <View style={styles.waveContainer}>
             <Animated.View
@@ -456,10 +728,9 @@ export default function HomeScreen() {
               isPaused ? (
                 <Text style={styles.controlIconText}>▶</Text>
               ) : (
-                <View style={styles.pauseIconContainer}>
-                  <View style={styles.pauseBar} />
-                  <View style={styles.pauseBar} />
-                </View>
+                <Text style={styles.liveTimerText}>
+                  {formatDuration(recordingMillis)}
+                </Text>
               )
             ) : (
               <View style={styles.innerRecordCircle} />
@@ -482,7 +753,7 @@ export default function HomeScreen() {
             ? "Tap to start recording"
             : isPaused
               ? "Recording paused. Tap to resume or click Finish"
-              : "Recording audio... Tap button to pause"}
+              : "Recording active... Tap button to pause"}
         </Text>
       </View>
     </SafeAreaView>
@@ -490,31 +761,21 @@ export default function HomeScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
+  container: { flex: 1, backgroundColor: "#F8F9FA" },
+  fixedHeaderContainer: {
     backgroundColor: "#F8F9FA",
-  },
-  scrollView: {
-    flex: 1,
-  },
-  scrollContent: {
-    paddingBottom: 180, // Generates healthy bottom margins to prevent footer collisions
-  },
-  innerWrapper: {
-    flex: 1,
+    zIndex: 10,
+    paddingBottom: 4,
   },
   headerTitle: {
     fontSize: 26,
     fontWeight: "700",
     color: "#1A1D20",
     textAlign: "center",
-    marginTop: 16,
+    marginTop: 12,
     marginBottom: 8,
   },
-  searchContainer: {
-    paddingHorizontal: 16,
-    marginBottom: 12,
-  },
+  searchContainer: { paddingHorizontal: 16, marginBottom: 12 },
   searchBar: {
     backgroundColor: "#d7d7d7",
     paddingVertical: 16,
@@ -523,22 +784,54 @@ const styles = StyleSheet.create({
     fontSize: 15,
     color: "#212529",
   },
-  listWrapper: {
-    paddingHorizontal: 16,
+  utilityHeaderRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingHorizontal: 20,
+    marginBottom: 8,
+    height: 30,
   },
-  emptyContainer: {
-    height: 200,
+  selectAllToggleBtn: { flexDirection: "row", alignItems: "center" },
+  checkboxOutline: {
+    width: 20,
+    height: 20,
+    borderRadius: 6,
+    borderWidth: 2,
+    borderColor: "#A0A5AA",
     justifyContent: "center",
     alignItems: "center",
+    marginRight: 8,
   },
-  emptyText: {
-    color: "#6C757D",
-    fontSize: 16,
+  checkboxChecked: { borderColor: "#007AFF", backgroundColor: "#007AFF" },
+  checkboxInnerDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: "#FFFFFF",
   },
+  utilityHeaderText: { fontSize: 14, fontWeight: "600", color: "#495057" },
+  bulkDeleteButton: {
+    backgroundColor: "#FFE3E3",
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+  },
+  bulkDeleteText: { color: "#D93838", fontSize: 13, fontWeight: "700" },
+
+  listScrollContent: { paddingHorizontal: 16, paddingTop: 4 },
+  emptyContainer: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    paddingBottom: 100,
+  },
+  emptyText: { color: "#6C757D", fontSize: 16 },
+
   card: {
     backgroundColor: "#ededed",
     borderRadius: 16,
-    padding: 16,
+    padding: 14,
     marginBottom: 12,
     shadowColor: "#00000065",
     shadowOffset: { width: 0, height: 2 },
@@ -546,14 +839,33 @@ const styles = StyleSheet.create({
     shadowRadius: 8,
     elevation: 2,
   },
+  cardMainRow: { flexDirection: "row", alignItems: "center" },
+  cardCheckboxHitbox: { paddingVertical: 10, paddingRight: 12 },
+  cardCheckboxOutline: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    borderWidth: 2,
+    borderColor: "#B0B5BB",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  cardCheckboxChecked: { borderColor: "#007AFF", backgroundColor: "#007AFF" },
+  cardCheckboxInnerDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: "#FFFFFF",
+  },
+  cardRightContent: { flex: 1 },
   cardMain: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
     borderBottomWidth: 1,
     borderBottomColor: "#dadada",
-    paddingBottom: 12,
-    marginBottom: 12,
+    paddingBottom: 10,
+    marginBottom: 10,
   },
   fileNameInput: {
     fontSize: 16,
@@ -563,11 +875,16 @@ const styles = StyleSheet.create({
     marginRight: 10,
     paddingVertical: 4,
   },
-  durationText: {
-    fontSize: 14,
-    color: "#6C757D",
-    fontWeight: "500",
+  durationText: { fontSize: 14, color: "#6C757D", fontWeight: "500" },
+  timelineContainer: { marginBottom: 12, paddingHorizontal: 4 },
+  slider: { width: "100%", height: 30, marginLeft: -10 },
+  timeLabelContainer: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginTop: -4,
+    paddingHorizontal: 2,
   },
+  timeText: { fontSize: 12, color: "#6C757D", fontWeight: "600" },
   actionsContainer: {
     flexDirection: "row",
     justifyContent: "flex-end",
@@ -580,15 +897,12 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
-  actionButtonText: {
-    color: "#000000",
-    fontSize: 13,
-    fontWeight: "600",
-  },
+  actionButtonText: { color: "#000000", fontSize: 13, fontWeight: "600" },
   btnPlay: { backgroundColor: "#c6dcf4" },
   btnPause: { backgroundColor: "#f2dcc5" },
   btnShare: { backgroundColor: "#bcf9d1" },
   btnDelete: { backgroundColor: "#f1b7b7" },
+
   footer: {
     position: "absolute",
     bottom: 0,
@@ -606,6 +920,7 @@ const styles = StyleSheet.create({
     shadowRadius: 6,
     elevation: 10,
   },
+  footerKeyboardActive: { paddingBottom: 12 },
   waveContainer: {
     flexDirection: "row",
     height: 30,
@@ -648,6 +963,12 @@ const styles = StyleSheet.create({
     backgroundColor: "#FF3B30",
   },
   controlIconText: { fontSize: 26, color: "#FF3B30", textAlign: "center" },
+  liveTimerText: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#FF3B30",
+    textAlign: "center",
+  },
   pauseIconContainer: {
     flexDirection: "row",
     justifyContent: "center",
