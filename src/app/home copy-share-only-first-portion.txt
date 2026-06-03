@@ -6,13 +6,11 @@ import * as FileSystem from "expo-file-system/legacy";
 import * as Sharing from "expo-sharing";
 import React, { useEffect, useRef, useState } from "react";
 import {
-  ActivityIndicator,
   Alert,
   Animated,
   FlatList,
   Keyboard,
   Modal,
-  NativeModules,
   Platform,
   StatusBar,
   StyleSheet,
@@ -33,15 +31,6 @@ interface RecordingItem {
 }
 
 const STORAGE_KEY = "@voice_recorder_recordings";
-const { AudioConcatModule } = NativeModules;
-
-interface AudioConcatModuleType {
-  concatenateM4a(inputUris: string[], outputUri: string): Promise<string>;
-}
-
-const audioConcatModule = AudioConcatModule as
-  | AudioConcatModuleType
-  | undefined;
 
 export default function HomeScreen() {
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
@@ -53,7 +42,6 @@ export default function HomeScreen() {
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [appendingItemId, setAppendingItemId] = useState<string | null>(null);
-  const [sharingItemId, setSharingItemId] = useState<string | null>(null);
   const [activeMenuCard, setActiveMenuCard] = useState<RecordingItem | null>(
     null,
   );
@@ -66,7 +54,6 @@ export default function HomeScreen() {
 
   const currentTrackIndexRef = useRef<number>(0);
   const accumulatedTimeRef = useRef<number>(0);
-  const segmentDurationsRef = useRef<number[]>([]);
 
   // Real-time Recording Timer State
   const [recordingMillis, setRecordingMillis] = useState<number>(0);
@@ -361,31 +348,7 @@ export default function HomeScreen() {
     }
   }
 
-  async function loadSegmentDurations(item: RecordingItem) {
-    const durations: number[] = [];
-    for (const uri of item.uris) {
-      try {
-        const { sound: testSound } = await Audio.Sound.createAsync(
-          { uri },
-          { shouldPlay: false },
-        );
-        const testStatus = await testSound.getStatusAsync();
-        if (testStatus.isLoaded) {
-          durations.push(testStatus.durationMillis || 0);
-        }
-        await testSound.unloadAsync();
-      } catch {
-        durations.push(0);
-      }
-    }
-    segmentDurationsRef.current = durations;
-  }
-
-  async function playPlaylistSegment(
-    item: RecordingItem,
-    index: number,
-    startPositionOffset = 0,
-  ) {
+  async function playPlaylistSegment(item: RecordingItem, index: number) {
     if (index >= item.uris.length) {
       stopPlayback();
       return;
@@ -395,22 +358,21 @@ export default function HomeScreen() {
       currentTrackIndexRef.current = index;
       const { sound: newSound } = await Audio.Sound.createAsync(
         { uri: item.uris[index] },
-        { shouldPlay: !isPlaybackPaused, positionMillis: startPositionOffset },
+        { shouldPlay: true },
       );
       setSound(newSound);
+      setIsPlaybackPaused(false);
 
       newSound.setOnPlaybackStatusUpdate((status: any) => {
         if (status.isLoaded) {
-          if (!isSeeking) {
+          if (!isSeeking)
             setPlaybackPosition(
               accumulatedTimeRef.current + status.positionMillis,
             );
-          }
           if (status.didJustFinish) {
             newSound.unloadAsync();
-            accumulatedTimeRef.current +=
-              segmentDurationsRef.current[index] || 0;
-            playPlaylistSegment(item, index + 1, 0);
+            accumulatedTimeRef.current += status.durationMillis || 0;
+            playPlaylistSegment(item, index + 1);
           }
         }
       });
@@ -436,16 +398,14 @@ export default function HomeScreen() {
 
       setPlaybackDuration(item.durationMillis);
       setPlayingId(item.id);
-      setIsPlaybackPaused(false);
       accumulatedTimeRef.current = 0;
-
-      await loadSegmentDurations(item);
-      await playPlaylistSegment(item, 0, 0);
+      await playPlaylistSegment(item, 0);
     } catch (error) {
       console.error(error);
     }
   }
 
+  // Toggle Play/Pause on the audio stream seamlessly
   async function handlePlaybackPlayPause() {
     if (!sound) return;
     try {
@@ -457,7 +417,7 @@ export default function HomeScreen() {
         setIsPlaybackPaused(true);
       }
     } catch (error) {
-      console.error(error);
+      console.error("Play-Pause modification execution failed:", error);
     }
   }
 
@@ -470,15 +430,12 @@ export default function HomeScreen() {
     setPlaybackPosition(0);
     setIsPlaybackPaused(false);
     accumulatedTimeRef.current = 0;
-    segmentDurationsRef.current = [];
   }
 
-  const handleSlidingStart = () => {
-    setIsSeeking(true);
-  };
+  const handleSlidingStart = () => setIsSeeking(true);
 
   const handleSlidingComplete = async (value: number) => {
-    if (!playingId) return;
+    if (!sound || !playingId) return;
     const targetItem = recordings.find((r) => r.id === playingId);
     if (!targetItem) return;
 
@@ -487,23 +444,53 @@ export default function HomeScreen() {
     let targetOffset = value;
 
     for (let i = 0; i < targetItem.uris.length; i++) {
-      const duration = segmentDurationsRef.current[i] || 0;
-      if (value >= totalCheck && value <= totalCheck + duration) {
-        targetIndex = i;
-        targetOffset = value - totalCheck;
-        break;
+      try {
+        const checkSound = new Audio.Sound();
+        const checkStatus = await checkSound.loadAsync({
+          uri: targetItem.uris[i],
+        });
+        const dMillis = checkStatus.isLoaded
+          ? checkStatus.durationMillis || 0
+          : 0;
+        await checkSound.unloadAsync();
+
+        if (value >= totalCheck && value <= totalCheck + dMillis) {
+          targetIndex = i;
+          targetOffset = value - totalCheck;
+          break;
+        }
+        totalCheck += dMillis;
+      } catch (e) {
+        console.error(e);
       }
-      totalCheck += duration;
     }
 
     try {
-      if (sound) {
-        await sound.unloadAsync();
-      }
+      await sound.unloadAsync();
       accumulatedTimeRef.current = totalCheck;
-      setPlaybackPosition(value);
       setIsSeeking(false);
-      await playPlaylistSegment(targetItem, targetIndex, targetOffset);
+      currentTrackIndexRef.current = targetIndex;
+
+      const { sound: newSound } = await Audio.Sound.createAsync(
+        { uri: targetItem.uris[targetIndex] },
+        { shouldPlay: !isPlaybackPaused, positionMillis: targetOffset },
+      );
+      setSound(newSound);
+      setPlaybackPosition(value);
+
+      newSound.setOnPlaybackStatusUpdate((status: any) => {
+        if (status.isLoaded) {
+          if (!isSeeking)
+            setPlaybackPosition(
+              accumulatedTimeRef.current + status.positionMillis,
+            );
+          if (status.didJustFinish) {
+            newSound.unloadAsync();
+            accumulatedTimeRef.current += status.durationMillis || 0;
+            playPlaylistSegment(targetItem, targetIndex + 1);
+          }
+        }
+      });
     } catch (err) {
       console.error(err);
       setIsSeeking(false);
@@ -609,10 +596,6 @@ export default function HomeScreen() {
               );
               setRecordings(updatedList);
               setSelectedIds([]);
-              await AsyncStorage.setItem(
-                STORAGE_KEY,
-                JSON.stringify(updatedList),
-              );
             } catch (error) {
               console.error(error);
             }
@@ -623,70 +606,33 @@ export default function HomeScreen() {
   }
 
   async function shareRecording(item: RecordingItem) {
-    if (sharingItemId) return;
-
-    setSharingItemId(item.id);
+    setActiveMenuCard(null);
     const isAvailable = await Sharing.isAvailableAsync();
-    if (!isAvailable) {
-      setSharingItemId(null);
-      Alert.alert("Error", "Sharing is not available on this device.");
-      return;
-    }
+    if (!isAvailable || item.uris.length === 0) return;
 
     let tempUri: string | null = null;
     try {
-      const existingUris: string[] = [];
+      const primaryUri = item.uris[0];
+      const sourceInfo = await FileSystem.getInfoAsync(primaryUri);
+      if (!sourceInfo.exists) return;
 
-      for (const uri of item.uris) {
-        const fileInfo = await FileSystem.getInfoAsync(uri);
-        if (fileInfo.exists) {
-          existingUris.push(uri);
-        }
-      }
-
-      if (existingUris.length === 0) {
-        Alert.alert("Share Failed", "Recording file was not found.");
-        return;
-      }
-
-      const sourceUri = existingUris[0];
-      const baseFileName = sourceUri.split("/").pop() || "recording.m4a";
+      const baseFileName = primaryUri.split("/").pop() || "recording.m4a";
       const fileExtension = baseFileName.includes(".")
         ? baseFileName.split(".").pop()
         : "m4a";
       const cleanFileName = item.name.replace(/[^a-zA-Z0-9_-]/g, "_");
       tempUri = `${FileSystem.cacheDirectory}${cleanFileName}_${Date.now()}.${fileExtension}`;
 
-      if (existingUris.length === 1) {
-        await FileSystem.copyAsync({ from: sourceUri, to: tempUri });
-      } else {
-        if (Platform.OS !== "android" || !audioConcatModule) {
-          Alert.alert(
-            "Share Failed",
-            "Full appended recording export is only available in the Android native build right now.",
-          );
-          return;
-        }
-
-        tempUri = await audioConcatModule.concatenateM4a(existingUris, tempUri);
-      }
-
-      await Sharing.shareAsync(tempUri, {
-        mimeType: "audio/x-m4a",
-        dialogTitle: `Share "${item.name}"`,
-      });
-
-      setActiveMenuCard(null);
+      await FileSystem.copyAsync({ from: primaryUri, to: tempUri });
+      await Sharing.shareAsync(tempUri, { mimeType: "audio/x-m4a" });
     } catch (error) {
-      console.error("Sharing Error:", error);
-      Alert.alert("Share Failed", "Unable to share this recording.");
+      console.error(error);
     } finally {
       if (tempUri) {
         const tempInfo = await FileSystem.getInfoAsync(tempUri);
         if (tempInfo.exists)
           await FileSystem.deleteAsync(tempUri, { idempotent: true });
       }
-      setSharingItemId(null);
     }
   }
 
@@ -840,15 +786,9 @@ export default function HomeScreen() {
         visible={activeMenuCard !== null}
         transparent={true}
         animationType="fade"
-        onRequestClose={() => {
-          if (!sharingItemId) setActiveMenuCard(null);
-        }}
+        onRequestClose={() => setActiveMenuCard(null)}
       >
-        <TouchableWithoutFeedback
-          onPress={() => {
-            if (!sharingItemId) setActiveMenuCard(null);
-          }}
-        >
+        <TouchableWithoutFeedback onPress={() => setActiveMenuCard(null)}>
           <View style={styles.modalOverlayBackground}>
             <TouchableWithoutFeedback>
               <View style={styles.popupActionSheetContent}>
@@ -881,6 +821,11 @@ export default function HomeScreen() {
                             ? "Stop playback"
                             : "Play recording"}
                         </Text>
+                        {/* <Text style={styles.popoverActionSubtitle}>
+                          {playingId === activeMenuCard.id
+                            ? "Stop the current audio track."
+                            : "Listen to this recording instantly."}
+                        </Text> */}
                       </View>
                     </TouchableOpacity>
 
@@ -900,43 +845,31 @@ export default function HomeScreen() {
                         <Text style={styles.popoverOptionText}>
                           Append segment
                         </Text>
+                        {/* <Text style={styles.popoverActionSubtitle}>
+                          Continue this recording with a new clip.
+                        </Text> */}
                       </View>
                     </TouchableOpacity>
 
                     <TouchableOpacity
-                      style={[
-                        styles.popoverActionOption,
-                        styles.btnShare,
-                        sharingItemId === activeMenuCard.id &&
-                          styles.popoverActionDisabled,
-                      ]}
+                      style={[styles.popoverActionOption, styles.btnShare]}
                       onPress={() => shareRecording(activeMenuCard)}
                       activeOpacity={0.82}
-                      disabled={sharingItemId === activeMenuCard.id}
                     >
                       <View style={[styles.modalActionIcon, styles.shareIcon]}>
-                        {sharingItemId === activeMenuCard.id ? (
-                          <ActivityIndicator size="small" color="#16803C" />
-                        ) : (
-                          <Ionicons
-                            name="share-social-outline"
-                            size={20}
-                            color="#1A1D20"
-                          />
-                        )}
+                        <Ionicons
+                          name="share-social-outline"
+                          size={20}
+                          color="#1A1D20"
+                        />
                       </View>
                       <View style={styles.modalActionBody}>
                         <Text style={styles.popoverOptionText}>
-                          {sharingItemId === activeMenuCard.id
-                            ? "Preparing full recording..."
-                            : "Share recording"}
+                          Share recording
                         </Text>
-                        {sharingItemId === activeMenuCard.id && (
-                          <Text style={styles.popoverActionSubtitle}>
-                            Large appended recordings can take a moment to
-                            export.
-                          </Text>
-                        )}
+                        {/* <Text style={styles.popoverActionSubtitle}>
+                          Send a copy to another app.
+                        </Text> */}
                       </View>
                     </TouchableOpacity>
 
@@ -956,6 +889,9 @@ export default function HomeScreen() {
                         <Text style={styles.popoverOptionText}>
                           Delete item
                         </Text>
+                        {/* <Text style={styles.popoverActionSubtitle}>
+                          Remove this recording permanently.
+                        </Text> */}
                       </View>
                     </TouchableOpacity>
 
@@ -966,17 +902,6 @@ export default function HomeScreen() {
                     >
                       <Text style={styles.popupCloseBtnText}>Close Menu</Text>
                     </TouchableOpacity>
-                  </View>
-                )}
-                {sharingItemId && (
-                  <View style={styles.sharePreparingOverlay}>
-                    <ActivityIndicator size="large" color="#16803C" />
-                    <Text style={styles.sharePreparingTitle}>
-                      Preparing share
-                    </Text>
-                    <Text style={styles.sharePreparingText}>
-                      Exporting the full recording into one audio file...
-                    </Text>
                   </View>
                 )}
               </View>
@@ -992,6 +917,7 @@ export default function HomeScreen() {
           keyboardHeight > 0 && styles.footerKeyboardActive,
         ]}
       >
+        {/* UPGRADED GLOBAL MUSIC PLAYER: FEATURES SEAMLESS PLAY & PAUSE CONTROLS */}
         {playingId && currentlyPlayingItem ? (
           <View style={styles.globalPlayerSheet}>
             <View style={styles.globalPlayerHeader}>
@@ -1001,6 +927,7 @@ export default function HomeScreen() {
               </Text>
 
               <View style={styles.globalControlBtnGroup}>
+                {/* Dynamic Play / Pause Trigger Switch Element */}
                 <TouchableOpacity
                   style={[styles.globalActionBtn, styles.btnPause]}
                   onPress={handlePlaybackPlayPause}
@@ -1045,6 +972,7 @@ export default function HomeScreen() {
             </View>
           </View>
         ) : (
+          /* HARDWARE RECORD CONTROLS MATRIX */
           <>
             {isRecordingActive && (
               <View style={styles.waveContainer}>
@@ -1195,6 +1123,7 @@ const styles = StyleSheet.create({
     borderRadius: 10,
   },
   bulkDeleteText: { color: "#D93838", fontSize: 13, fontWeight: "700" },
+
   listScrollContent: { paddingHorizontal: 16, paddingTop: 4 },
   emptyContainer: {
     flex: 1,
@@ -1203,6 +1132,7 @@ const styles = StyleSheet.create({
     paddingBottom: 100,
   },
   emptyText: { color: "#6C757D", fontSize: 16 },
+
   card: {
     backgroundColor: "#ededed",
     borderRadius: 16,
@@ -1238,7 +1168,7 @@ const styles = StyleSheet.create({
   },
   cardTitleBlock: { flex: 1, justifyContent: "center" },
   fileNameInput: {
-    fontSize: 14,
+    fontSize: 16,
     fontWeight: "600",
     color: "#212529",
     paddingVertical: 2,
@@ -1250,6 +1180,7 @@ const styles = StyleSheet.create({
     fontWeight: "500",
     marginTop: 2,
   },
+
   menuTriggerBtn: {
     backgroundColor: "#e2e2e2",
     paddingVertical: 8,
@@ -1258,6 +1189,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   menuTriggerText: { fontSize: 13, fontWeight: "700", color: "#495057" },
+
   modalOverlayBackground: {
     flex: 1,
     backgroundColor: "#00000055",
@@ -1290,17 +1222,16 @@ const styles = StyleSheet.create({
   popoverActionOption: {
     flexDirection: "row",
     alignItems: "center",
-    paddingVertical: 6,
+    paddingVertical: 14,
     paddingHorizontal: 14,
     borderRadius: 22,
     borderWidth: 1,
-    shadowColor: "#0000003c",
+    shadowColor: "#00000066",
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.05,
     shadowRadius: 10,
     elevation: 2,
   },
-  popoverActionDisabled: { opacity: 0.68 },
   popoverActionMenuStack: {
     marginTop: 14,
     borderTopWidth: 1,
@@ -1334,29 +1265,7 @@ const styles = StyleSheet.create({
     borderRadius: 18,
   },
   popupCloseBtnText: { fontSize: 14, fontWeight: "700", color: "#007AFF" },
-  sharePreparingOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: "#FFFFFFE8",
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    justifyContent: "center",
-    alignItems: "center",
-    paddingHorizontal: 28,
-  },
-  sharePreparingTitle: {
-    color: "#101828",
-    fontSize: 17,
-    fontWeight: "800",
-    marginTop: 14,
-  },
-  sharePreparingText: {
-    color: "#667085",
-    fontSize: 13,
-    fontWeight: "600",
-    lineHeight: 18,
-    marginTop: 6,
-    textAlign: "center",
-  },
+
   globalPlayerSheet: { width: "100%", paddingHorizontal: 20, paddingTop: 4 },
   globalPlayerHeader: {
     flexDirection: "row",
@@ -1371,6 +1280,7 @@ const styles = StyleSheet.create({
     flex: 1,
     marginRight: 12,
   },
+
   globalControlBtnGroup: { flexDirection: "row", alignItems: "center", gap: 6 },
   globalActionBtn: {
     minHeight: 38,
@@ -1394,6 +1304,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   globalStopText: { color: "#B42318", fontSize: 12, fontWeight: "800" },
+
   timelineContainer: { width: "100%", marginTop: 8 },
   slider: { width: "100%", height: 30, marginLeft: -10 },
   timeLabelContainer: {
@@ -1403,6 +1314,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 2,
   },
   timeText: { fontSize: 12, color: "#6C757D", fontWeight: "600" },
+
   btnPlay: { backgroundColor: "#EEF4FF", borderColor: "#D8E4FF" },
   appendIcon: { backgroundColor: "#EAFDF3" },
   playIcon: { backgroundColor: "#F2F4F7" },
@@ -1411,6 +1323,7 @@ const styles = StyleSheet.create({
   shareIcon: { backgroundColor: "#ECFDF3" },
   btnDelete: { backgroundColor: "#FEF3F2", borderColor: "#FECACA" },
   deleteIcon: { backgroundColor: "#FEF3F2" },
+
   footer: {
     position: "absolute",
     bottom: 0,
@@ -1468,7 +1381,10 @@ const styles = StyleSheet.create({
     shadowRadius: 10,
     elevation: 4,
   },
-  recordingActive: { borderColor: "#FF3B30", backgroundColor: "#FFF7F6" },
+  recordingActive: {
+    borderColor: "#FF3B30",
+    backgroundColor: "#FFF7F6",
+  },
   innerRecordCircle: {
     width: 54,
     height: 54,
